@@ -114,6 +114,33 @@ def _normalize_assigned_codes(df: pd.DataFrame) -> pd.DataFrame:
     return normalized
 
 
+def _subset_gene_lbarid_range(
+    genesdf: pd.DataFrame,
+    enabled: bool,
+    start_lbar_id: int,
+    end_lbar_id: int,
+) -> pd.DataFrame:
+    genesdf = _drop_exported_index_columns(genesdf).copy()
+    if not enabled:
+        return genesdf
+
+    required_columns = {"Gene", "LbarID"}
+    missing = required_columns - set(genesdf.columns)
+    if missing:
+        raise gr.Error(f"Input CSV is missing required column(s): {', '.join(sorted(missing))}")
+
+    genesdf["LbarID"] = pd.to_numeric(genesdf["LbarID"], errors="raise").astype(int)
+    start_lbar_id = int(start_lbar_id)
+    end_lbar_id = int(end_lbar_id)
+    if start_lbar_id > end_lbar_id:
+        raise gr.Error("Subset start LbarID must be less than or equal to subset end LbarID.")
+
+    subset = genesdf.loc[genesdf["LbarID"].between(start_lbar_id, end_lbar_id), :].copy()
+    if subset.empty:
+        raise gr.Error(f"No rows found with LbarID between {start_lbar_id} and {end_lbar_id}.")
+    return subset.reset_index(drop=True)
+
+
 def _duplicate_lbarid_warning(assigned_codes: pd.DataFrame) -> str:
     duplicated = assigned_codes.loc[assigned_codes["LbarID"].duplicated(keep=False), "LbarID"]
     if duplicated.empty:
@@ -848,8 +875,25 @@ def run(protocol):
 """
 
 
-def run_assign_workflow(uploaded_file, separator, channels, use_hamming, tag, random_state):
+def run_assign_workflow(
+    uploaded_file,
+    separator,
+    channels,
+    use_hamming,
+    tag,
+    random_state,
+    subset_range,
+    subset_start_lbar_id,
+    subset_end_lbar_id,
+):
     genesdf = _read_csv(uploaded_file, separator)
+    input_rows = len(genesdf)
+    genesdf = _subset_gene_lbarid_range(
+        genesdf,
+        bool(subset_range),
+        int(subset_start_lbar_id),
+        int(subset_end_lbar_id),
+    )
     assigned_codes, codebook, hamming_matrix, required_cycles = assign_geneslist_to_codebook(
         genesdf,
         channels=int(channels),
@@ -865,6 +909,11 @@ def run_assign_workflow(uploaded_file, separator, channels, use_hamming, tag, ra
         f"Created {len(assigned_codes)} assigned codes with {required_cycles} cycles "
         f"and {int(channels)} channels."
     )
+    if subset_range:
+        summary += (
+            f" Subset input from {input_rows} rows to {len(genesdf)} rows using "
+            f"LbarID {int(subset_start_lbar_id)}-{int(subset_end_lbar_id)}."
+        )
     return summary, assigned_codes, assigned_path, codebook_path, hamming_path
 
 
@@ -933,12 +982,30 @@ def run_verify_workflow(
     return summary, selected, issues, selected_path, issues_path
 
 
-def run_full_workflow(uploaded_file, separator, channels, use_hamming, tag, random_state, starting_id):
+def run_full_workflow(
+    uploaded_file,
+    separator,
+    channels,
+    use_hamming,
+    tag,
+    random_state,
+    starting_id,
+    subset_range,
+    subset_start_lbar_id,
+    subset_end_lbar_id,
+):
     genesdf = _read_csv(uploaded_file, separator)
     clean_tag = _clean_tag(tag, "standard_barcoding_scheme")
     channels = int(channels)
     random_state = int(random_state)
     starting_id = int(starting_id)
+    input_rows = len(genesdf)
+    genesdf = _subset_gene_lbarid_range(
+        genesdf,
+        bool(subset_range),
+        int(subset_start_lbar_id),
+        int(subset_end_lbar_id),
+    )
 
     assigned_codes, codebook, hamming_matrix, required_cycles = assign_geneslist_to_codebook(
         genesdf,
@@ -972,10 +1039,14 @@ def run_full_workflow(uploaded_file, separator, channels, use_hamming, tag, rand
         f"- Hamming-distance extra cycle: {bool(use_hamming)}",
         f"- Random seed: {random_state}",
         f"- Plate starting ID: {starting_id}",
+        f"- Subset to LbarID range: {bool(subset_range)}",
+        f"- Subset LbarID start: {int(subset_start_lbar_id)}",
+        f"- Subset LbarID end: {int(subset_end_lbar_id)}",
+        f"- Rows after optional subset: {len(genesdf)}",
         f"- Output tag: {clean_tag}",
         "",
         "Assignment",
-        f"- Input rows: {len(genesdf)}",
+        f"- Uploaded input rows: {input_rows}",
         f"- Assigned rows: {len(assigned_codes)}",
         f"- Required cycles: {required_cycles}",
         f"- Codebook shape: {codebook.shape[0]} rows x {codebook.shape[1]} columns",
@@ -1062,6 +1133,12 @@ with gr.Blocks(title="L-probe Barcode Tools") as demo:
         full_tag = gr.Textbox(label="Output tag", value="standard_barcoding_scheme")
         full_random_state = gr.Number(label="Random seed", value=0, precision=0)
         full_starting_id = gr.Number(label="Plate starting ID", value=201, precision=0)
+        full_subset_range = gr.Checkbox(
+            label="Subset input to an LbarID range before assigning codebook",
+            value=False,
+        )
+        full_subset_start_lbar_id = gr.Number(label="Subset start LbarID", value=201, precision=0)
+        full_subset_end_lbar_id = gr.Number(label="Subset end LbarID", value=296, precision=0)
         full_button = gr.Button("Run full workflow", variant="primary")
         full_report = gr.Textbox(label="Workflow report", lines=18, interactive=False)
         full_assigned_preview = gr.Dataframe(label="Assigned codes preview", interactive=False)
@@ -1077,6 +1154,12 @@ with gr.Blocks(title="L-probe Barcode Tools") as demo:
         assign_hamming = gr.Checkbox(label="Add one extra cycle for Hamming-distance error correction", value=True)
         assign_tag = gr.Textbox(label="Output tag", value="standard_barcoding_scheme")
         assign_random_state = gr.Number(label="Random seed", value=0, precision=0)
+        assign_subset_range = gr.Checkbox(
+            label="Subset input to an LbarID range before assigning codebook",
+            value=False,
+        )
+        assign_subset_start_lbar_id = gr.Number(label="Subset start LbarID", value=201, precision=0)
+        assign_subset_end_lbar_id = gr.Number(label="Subset end LbarID", value=296, precision=0)
         assign_button = gr.Button("Run assignment", variant="primary")
         assign_summary = gr.Textbox(label="Summary", interactive=False)
         assigned_preview = gr.Dataframe(label="Assigned codes preview", interactive=False)
@@ -1167,6 +1250,9 @@ with gr.Blocks(title="L-probe Barcode Tools") as demo:
             full_tag,
             full_random_state,
             full_starting_id,
+            full_subset_range,
+            full_subset_start_lbar_id,
+            full_subset_end_lbar_id,
         ],
         outputs=[
             full_report,
@@ -1178,7 +1264,17 @@ with gr.Blocks(title="L-probe Barcode Tools") as demo:
     )
     assign_button.click(
         run_assign_workflow,
-        inputs=[genes_file, genes_separator, assign_channels, assign_hamming, assign_tag, assign_random_state],
+        inputs=[
+            genes_file,
+            genes_separator,
+            assign_channels,
+            assign_hamming,
+            assign_tag,
+            assign_random_state,
+            assign_subset_range,
+            assign_subset_start_lbar_id,
+            assign_subset_end_lbar_id,
+        ],
         outputs=[assign_summary, assigned_preview, assigned_download, codebook_download, hamming_download],
     )
     robot_button.click(
