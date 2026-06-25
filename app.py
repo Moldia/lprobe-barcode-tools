@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 import re
 import tempfile
 import zipfile
@@ -166,6 +167,14 @@ def _well_from_index(well_index: int) -> str:
     return f"{rows[row_index]}{column_index + 1}"
 
 
+def _destination_wells_for_cycles(cycle_count: int) -> list[str]:
+    rows = "ABCD"
+    wells = [f"{row}{column}" for row in rows for column in range(1, 7)]
+    if int(cycle_count) > len(wells):
+        raise gr.Error(f"{cycle_count} cycles requested, but the 24-tube destination rack supports at most {len(wells)} cycles.")
+    return wells[:int(cycle_count)]
+
+
 def _render_plate(active_well_index: int | None = None, active_steps: list[int] | None = None) -> str:
     active_steps = active_steps or []
     wells = []
@@ -188,8 +197,7 @@ def _render_tube_rack(explanation: pd.DataFrame) -> str:
         row["Destination well"]: int(position) + 1 for position, (_, row) in enumerate(explanation.iterrows())
     }
     tubes = []
-    for i in range(1, 7):
-        well = f"A{i}"
+    for well in _destination_wells_for_cycles(24):
         order = destination_by_well.get(well)
         step_class = f"path-marker path-step-{order}" if order else ""
         tubes.append(
@@ -231,7 +239,7 @@ def render_pipetting_viewer(explanation: pd.DataFrame) -> str:
         if slot == 1:
             body = _render_tube_rack(explanation)
             label = "Destination tube rack"
-            detail = "Cycles land in A1-A5"
+            detail = "Cycles land row-wise across the 24-tube rack"
             kind = "destination"
         elif 2 <= slot <= 6:
             channel = slot - 1
@@ -459,11 +467,11 @@ def render_pipetting_viewer(explanation: pd.DataFrame) -> str:
 .viewer-tube-rack {{
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 8px;
+  gap: 5px;
   padding-top: 8px;
 }}
 .viewer-tube {{
-  min-height: 62px;
+  min-height: 34px;
   border-radius: 999px;
   border: 1px solid #99b6b0;
   background: #ecfdf5;
@@ -679,11 +687,12 @@ def explain_barcode_pipetting(assigned_codes: pd.DataFrame, lbar_id: int) -> pd.
 
     record = match.iloc[0]
     plate_number, starting_id, well_index, source_well = _barcode_plate_info(lbar_id)
+    destination_wells = _destination_wells_for_cycles(len(assigned_codes.columns[2:]))
     explained = []
     for cycle_index, cycle in enumerate(assigned_codes.columns[2:]):
         channel = int(record[cycle])
         source_deck_slot = channel + 1
-        destination_well = f"A{cycle_index + 1}"
+        destination_well = destination_wells[cycle_index]
         explained.append(
             {
                 "Gene": record["Gene"],
@@ -705,6 +714,7 @@ def explain_barcode_pipetting(assigned_codes: pd.DataFrame, lbar_id: int) -> pd.
 
 def _instruction_rows_from_mask(mask: pd.DataFrame, assigned_codes: pd.DataFrame, starting_id: int, issue_type: str) -> list[dict]:
     assigned_lookup = assigned_codes.set_index("LbarID")["Gene"].to_dict()
+    destination_wells = _destination_wells_for_cycles(mask.shape[1])
     rows = []
     for robot_row, robot_col in zip(*np.where(mask.to_numpy())):
         channel = (int(robot_row) // 96) + 1
@@ -718,7 +728,7 @@ def _instruction_rows_from_mask(mask: pd.DataFrame, assigned_codes: pd.DataFrame
                 "Source deck slot": channel + 1,
                 "Source well": _well_from_index(well_index),
                 "Destination deck slot": 1,
-                "Destination well": f"A{int(robot_col) + 1}",
+                "Destination well": destination_wells[int(robot_col)],
                 "LbarID": lbar_id,
                 "Gene": assigned_lookup.get(lbar_id, ""),
                 "Robot CSV row": int(robot_row),
@@ -805,24 +815,49 @@ def generate_opentrons_protocol(
     destination_labware: str = "opentrons_24_tuberack_eppendorf_2ml_safelock_snapcap",
     pipette_name: str = "p20_single_gen2",
     pipette_mount: str = "left",
+    robot_input_data: pd.DataFrame | None = None,
+    embed_robot_input: bool = False,
 ) -> str:
     clean_robot_input_filename = Path(str(robot_input_filename)).name
-    return f"""import pandas as pd
+    if embed_robot_input:
+        if robot_input_data is None:
+            raise gr.Error("Upload or generate robot input data before creating a self-contained protocol.")
+        embedded_rows = robot_input_data.fillna(0).astype(int).to_numpy().tolist()
+        import_section = ""
+        input_section = f"""ROBOT_INPUT_ROWS = {json.dumps(embedded_rows, separators=(",", ":"))}
 
-metadata = {{
+
+def read_input_data():
+    if not ROBOT_INPUT_ROWS:
+        return []
+    column_count = len(ROBOT_INPUT_ROWS[0])
+    return [[row[column_index] for row in ROBOT_INPUT_ROWS] for column_index in range(column_count)]
+"""
+    else:
+        import_section = "import pandas as pd\n\n"
+        input_section = f"""ROBOT_INPUT_FILE = '/data/user_storage/{_clean_python_string(clean_robot_input_filename)}'
+
+
+def read_input_data():
+    df = pd.read_csv(ROBOT_INPUT_FILE, header=None)
+    return [df[i].tolist() for i in df.columns]
+"""
+
+    return f"""{import_section}metadata = {{
     'protocolName': '{_clean_python_string(protocol_name)}',
     'author': 'Generated by L-probe Barcode Tools',
     'source': 'L-probe Barcode Tools',
     'apiLevel': '2.19'
 }}
 
-ROBOT_INPUT_FILE = '/data/user_storage/{_clean_python_string(clean_robot_input_filename)}'
 TRANSFER_VOLUME_UL = {float(transfer_volume)}
 SOURCE_LABWARE = '{_clean_python_string(source_labware)}'
 DESTINATION_LABWARE = '{_clean_python_string(destination_labware)}'
 PIPETTE_NAME = '{_clean_python_string(pipette_name)}'
 PIPETTE_MOUNT = '{_clean_python_string(pipette_mount)}'
 
+
+{input_section}
 
 def load_labware(protocol):
     plate_dict = {{str(i): protocol.load_labware(SOURCE_LABWARE, location=str(i)) for i in range(2, 7)}}
@@ -834,9 +869,11 @@ def load_instruments(protocol, tipracks):
     return protocol.load_instrument(PIPETTE_NAME, mount=PIPETTE_MOUNT, tip_racks=tipracks)
 
 
-def read_input_file(filepath):
-    df = pd.read_csv(filepath, header=None)
-    return [df[i].tolist() for i in df.columns]
+def destination_wells_for_cycles(cycle_count):
+    wells = [f'{{row}}{{column}}' for row in 'ABCD' for column in range(1, 7)]
+    if cycle_count > len(wells):
+        raise ValueError(f'Robot input has {{cycle_count}} cycles, but the destination rack supports at most {{len(wells)}} cycles.')
+    return wells[:cycle_count]
 
 
 def transfer_liquid(pipette, sublist, plate_source, destination, fixed_vol=TRANSFER_VOLUME_UL):
@@ -860,12 +897,10 @@ def run(protocol):
     pipette = load_instruments(protocol, tipracks)
 
     block = protocol.load_labware(DESTINATION_LABWARE, '1')
-    block_destinations = [block.wells('A' + str(i)) for i in range(1, 6)]
 
-    cycle_data = read_input_file(ROBOT_INPUT_FILE)
-
-    if len(cycle_data) > len(block_destinations):
-        raise ValueError(f'Robot input has {{len(cycle_data)}} cycles, but this protocol has {{len(block_destinations)}} destination wells.')
+    cycle_data = read_input_data()
+    destination_wells = destination_wells_for_cycles(len(cycle_data))
+    block_destinations = [block.wells_by_name()[well] for well in destination_wells]
 
     for cycle_index, cycle in enumerate(cycle_data):
         for i in range(0, len(cycle), 96):
@@ -928,6 +963,9 @@ def run_robot_workflow(uploaded_file, separator, starting_id, tag):
 
 def run_protocol_workflow(
     robot_input_filename,
+    robot_input_file,
+    robot_input_separator,
+    embed_robot_input,
     protocol_name,
     protocol_tag,
     transfer_volume,
@@ -937,7 +975,11 @@ def run_protocol_workflow(
     pipette_mount,
 ):
     clean_tag = _clean_tag(protocol_tag, "opentrons_protocol")
-    if not str(robot_input_filename).strip():
+    embed_robot_input = bool(embed_robot_input)
+    robot_input_data = None
+    if embed_robot_input:
+        robot_input_data = _read_robot_input_csv(robot_input_file, robot_input_separator)
+    elif not str(robot_input_filename).strip():
         raise gr.Error("Enter the robot input filename as it will appear in Opentrons user storage.")
 
     protocol_text = generate_opentrons_protocol(
@@ -948,9 +990,17 @@ def run_protocol_workflow(
         destination_labware=str(destination_labware).strip(),
         pipette_name=str(pipette_name).strip(),
         pipette_mount=str(pipette_mount).strip(),
+        robot_input_data=robot_input_data,
+        embed_robot_input=embed_robot_input,
     )
     protocol_path = _write_text_file(protocol_text, f"opentrons_cherry_picking_{clean_tag}.py")
-    summary = f"Created Opentrons protocol for /data/user_storage/{Path(str(robot_input_filename)).name}"
+    if embed_robot_input:
+        summary = (
+            "Created self-contained Opentrons protocol with embedded robot input "
+            f"({robot_input_data.shape[0]} rows x {robot_input_data.shape[1]} cycles)."
+        )
+    else:
+        summary = f"Created Opentrons protocol for /data/user_storage/{Path(str(robot_input_filename)).name}"
     return summary, protocol_text, protocol_path
 
 
@@ -993,12 +1043,14 @@ def run_full_workflow(
     subset_range,
     subset_start_lbar_id,
     subset_end_lbar_id,
+    embed_protocol_robot_input,
 ):
     genesdf = _read_csv(uploaded_file, separator)
     clean_tag = _clean_tag(tag, "standard_barcoding_scheme")
     channels = int(channels)
     random_state = int(random_state)
     starting_id = int(starting_id)
+    embed_protocol_robot_input = bool(embed_protocol_robot_input)
     input_rows = len(genesdf)
     genesdf = _subset_gene_lbarid_range(
         genesdf,
@@ -1028,6 +1080,8 @@ def run_full_workflow(
         robot_input_filename=robot_input_filename,
         protocol_name=f"L-probe cherry picking {clean_tag} plate {starting_id}",
         transfer_volume=10,
+        robot_input_data=robot_input if embed_protocol_robot_input else None,
+        embed_robot_input=embed_protocol_robot_input,
     )
     report_lines = [
         "L-probe barcode workflow report",
@@ -1058,7 +1112,16 @@ def run_full_workflow(
         f"- Active transfer instructions: {transfer_count}",
         "- Robot input CSV is written without headers or index for Opentrons compatibility",
         f"- Opentrons protocol file: {protocol_filename}",
-        f"- Protocol expects robot input at: /data/user_storage/{robot_input_filename}",
+        (
+            "- Opentrons protocol is self-contained and embeds the robot input data"
+            if embed_protocol_robot_input
+            else f"- Opentrons protocol expects robot input at: /data/user_storage/{robot_input_filename}"
+        ),
+        (
+            f"- Robot input CSV is also included separately for checking: {robot_input_filename}"
+            if embed_protocol_robot_input
+            else "- Robot input CSV must be uploaded/transferred to Opentrons user storage"
+        ),
         "",
         "Verification",
         f"- {verification_summary}",
@@ -1113,18 +1176,18 @@ with gr.Blocks(title="L-probe Barcode Tools") as demo:
     gr.Markdown("# L-probe Barcode Tools")
     workflow = gr.Radio(
         [
-            "Run full workflow",
             "Assign codebook",
             "Generate robot input",
-            "Generate Opentrons protocol",
             "Explain barcode pipetting",
             "Verify robot input",
+            "Generate Opentrons protocol",
+            "Run full workflow",
         ],
         label="Workflow",
-        value="Run full workflow",
+        value="Assign codebook",
     )
 
-    with gr.Group(visible=True) as full_panel:
+    with gr.Group(visible=False) as full_panel:
         gr.Markdown("## Run full workflow")
         full_genes_file = gr.File(label="Gene/LbarID CSV")
         full_separator = gr.Radio([",", ";", "\\t"], label="CSV separator", value=";")
@@ -1139,6 +1202,10 @@ with gr.Blocks(title="L-probe Barcode Tools") as demo:
         )
         full_subset_start_lbar_id = gr.Number(label="Subset start LbarID", value=201, precision=0)
         full_subset_end_lbar_id = gr.Number(label="Subset end LbarID", value=296, precision=0)
+        full_embed_protocol_robot_input = gr.Checkbox(
+            label="Embed robot input in Opentrons protocol file",
+            value=True,
+        )
         full_button = gr.Button("Run full workflow", variant="primary")
         full_report = gr.Textbox(label="Workflow report", lines=18, interactive=False)
         full_assigned_preview = gr.Dataframe(label="Assigned codes preview", interactive=False)
@@ -1146,7 +1213,7 @@ with gr.Blocks(title="L-probe Barcode Tools") as demo:
         full_issues_preview = gr.Dataframe(label="Verification issues", interactive=False)
         full_zip_download = gr.File(label="Download all outputs as ZIP")
 
-    with gr.Group(visible=False) as assign_panel:
+    with gr.Group(visible=True) as assign_panel:
         gr.Markdown("## Assign codebook")
         genes_file = gr.File(label="Gene/LbarID CSV")
         genes_separator = gr.Radio([",", ";", "\\t"], label="CSV separator", value=";")
@@ -1180,8 +1247,14 @@ with gr.Blocks(title="L-probe Barcode Tools") as demo:
 
     with gr.Group(visible=False) as protocol_panel:
         gr.Markdown("## Generate Opentrons protocol")
+        protocol_embed_robot_input = gr.Checkbox(
+            label="Embed robot input in protocol file",
+            value=True,
+        )
+        protocol_robot_file = gr.File(label="Robot input CSV to embed")
+        protocol_robot_separator = gr.Radio([",", ";", "\\t"], label="Robot input CSV separator", value=",")
         protocol_robot_filename = gr.Textbox(
-            label="Robot input filename in Opentrons user storage",
+            label="Robot input filename in Opentrons user storage (only needed when not embedding)",
             value="robot_input_plate_201_standard_barcoding_scheme.csv",
         )
         protocol_name = gr.Textbox(label="Protocol name", value="L-probe cherry picking")
@@ -1253,6 +1326,7 @@ with gr.Blocks(title="L-probe Barcode Tools") as demo:
             full_subset_range,
             full_subset_start_lbar_id,
             full_subset_end_lbar_id,
+            full_embed_protocol_robot_input,
         ],
         outputs=[
             full_report,
@@ -1286,6 +1360,9 @@ with gr.Blocks(title="L-probe Barcode Tools") as demo:
         run_protocol_workflow,
         inputs=[
             protocol_robot_filename,
+            protocol_robot_file,
+            protocol_robot_separator,
+            protocol_embed_robot_input,
             protocol_name,
             protocol_tag,
             protocol_volume,

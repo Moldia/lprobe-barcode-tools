@@ -9,6 +9,7 @@ This app is packaged for SciLifeLab Serve Gradio hosting.
 - `requirements.txt`: Python dependencies.
 - `Dockerfile`: Docker image definition for Serve.
 - `.dockerignore`: keeps local notebooks, outputs, and virtual environments out of the image.
+- `APP_USER_GUIDE.md`: user-facing workflow, input, output, and Opentrons usage documentation.
 
 ## Local Docker build
 
