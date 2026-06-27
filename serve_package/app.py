@@ -84,12 +84,35 @@ def _empty_issues_df() -> pd.DataFrame:
     ])
 
 
+METADATA_COLUMNS = {"Pool", "Pool position"}
+
+
 def _drop_exported_index_columns(df: pd.DataFrame) -> pd.DataFrame:
     index_like_columns = [
         column for column in df.columns
         if str(column).startswith("Unnamed:") or str(column).lower() == "index"
     ]
     return df.drop(columns=index_like_columns)
+
+
+def _cycle_columns(df: pd.DataFrame) -> list:
+    columns = []
+    for column in df.columns:
+        if column in {"Gene", "LbarID"} or str(column) in METADATA_COLUMNS:
+            continue
+        try:
+            int(str(column))
+        except ValueError:
+            continue
+        columns.append(column)
+    return columns
+
+
+def _assigned_columns(df: pd.DataFrame) -> list:
+    columns = ["Gene", "LbarID"]
+    columns.extend(column for column in ["Pool", "Pool position"] if column in df.columns)
+    columns.extend(_cycle_columns(df))
+    return columns
 
 
 def _normalize_assigned_codes(df: pd.DataFrame) -> pd.DataFrame:
@@ -99,17 +122,20 @@ def _normalize_assigned_codes(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise gr.Error(f"Assigned-codes CSV is missing required column(s): {', '.join(sorted(missing))}")
 
-    lbarid_position = df.columns.get_loc("LbarID")
-    cycle_columns = list(df.columns[lbarid_position + 1:])
+    cycle_columns = _cycle_columns(df)
     if not cycle_columns:
-        raise gr.Error("Assigned-codes CSV must include at least one cycle column after LbarID.")
+        raise gr.Error("Assigned-codes CSV must include at least one numeric cycle column.")
 
-    normalized = df.loc[:, ["Gene", "LbarID", *cycle_columns]].copy()
+    normalized = df.loc[:, _assigned_columns(df)].copy()
     normalized = normalized.dropna(subset=["Gene", "LbarID", *cycle_columns])
     if normalized.empty:
         raise gr.Error("Assigned-codes CSV does not contain any complete Gene/LbarID/cycle rows.")
 
     normalized["LbarID"] = pd.to_numeric(normalized["LbarID"], errors="raise").astype(int)
+    if "Pool" in normalized.columns:
+        normalized["Pool"] = pd.to_numeric(normalized["Pool"], errors="raise").astype(int)
+    if "Pool position" in normalized.columns:
+        normalized["Pool position"] = pd.to_numeric(normalized["Pool position"], errors="raise").astype(int)
     for cycle in cycle_columns:
         normalized[cycle] = pd.to_numeric(normalized[cycle], errors="raise").astype(int)
     return normalized
@@ -224,10 +250,14 @@ def render_pipetting_viewer(explanation: pd.DataFrame) -> str:
     }
     first = explanation.iloc[0]
     source_well = str(first["Source well"])
-    source_well_index = int(str(first["Robot CSV row"])) % 96
+    source_well_index = None
+    active_robot_rows = pd.to_numeric(explanation["Robot CSV row"], errors="coerce").dropna()
+    if not active_robot_rows.empty:
+        source_well_index = int(active_robot_rows.iloc[0]) % 96
     active_slots: dict[int, list[int]] = {}
     for position, (_, row) in enumerate(explanation.iterrows(), start=1):
-        active_slots.setdefault(int(row["Source deck slot"]), []).append(position)
+        if int(row["Channel"]) > 0:
+            active_slots.setdefault(int(row["Source deck slot"]), []).append(position)
     deck_slots = [
         [4, 5, 6],
         [1, 2, 3],
@@ -276,10 +306,14 @@ def render_pipetting_viewer(explanation: pd.DataFrame) -> str:
             f"<li class=\"viewer-step viewer-step-{position}{status_class}\">"
             f"<strong>{position}</strong>"
             f"<span>Cycle {escape(str(row['Cycle']))}</span>"
-            f"<span>from slot {int(row['Source deck slot'])}, {escape(str(row['Source well']))}</span>"
-            f"<span>to slot {int(row['Destination deck slot'])}, {escape(str(row['Destination well']))}</span>"
-            f"{status_html}"
-            "</li>"
+            + (
+                f"<span>from slot {int(row['Source deck slot'])}, {escape(str(row['Source well']))}</span>"
+                if int(row["Channel"]) > 0
+                else "<span>no transfer</span>"
+            )
+            + f"<span>to slot {int(row['Destination deck slot'])}, {escape(str(row['Destination well']))}</span>"
+            + f"{status_html}"
+            + "</li>"
         )
 
     title = f"{escape(str(first['Gene']))} · LbarID {int(first['LbarID'])}"
@@ -290,6 +324,8 @@ def render_pipetting_viewer(explanation: pd.DataFrame) -> str:
     hover_blocks = []
     for step, (_, row) in enumerate(explanation.iterrows(), start=1):
         channel = int(row["Channel"])
+        if channel == 0:
+            continue
         color = oligo_colors.get(channel, "#2563eb")
         text_color = "#172033" if channel == 3 else "#ffffff"
         hover_blocks.append(
@@ -594,6 +630,10 @@ def assign_geneslist_to_codebook(
     channels: int,
     hamming_distance: bool = True,
     random_state: int = 0,
+    split_pools: bool = False,
+    pool_size: int = 48,
+    allow_zero_cycles: bool = False,
+    min_active_cycles: int = 2,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, int]:
     genesdf = _drop_exported_index_columns(genesdf)
     required_columns = {"Gene", "LbarID"}
@@ -603,47 +643,109 @@ def assign_geneslist_to_codebook(
 
     genesdf = genesdf.reset_index(drop=True).copy()
     ngenes = len(genesdf)
-    if ngenes <= channels:
-        raise gr.Error("The number of genes must be greater than the number of channels.")
+    if ngenes == 0:
+        raise gr.Error("Input CSV does not contain any rows.")
 
-    required_cycles = math.ceil(math.log((ngenes - channels), channels)) + int(hamming_distance)
-    combinations = np.array(list(product(range(1, channels + 1), repeat=required_cycles)), dtype=np.int16)
+    channels = int(channels)
+    if channels < 1:
+        raise gr.Error("Channels must be at least 1.")
 
-    homogeneous = np.all(combinations == combinations[:, [0]], axis=1)
-    combinations = combinations[~homogeneous]
+    pool_size = int(pool_size)
+    if split_pools and pool_size < 1:
+        raise gr.Error("Pool size must be at least 1 when split pools are enabled.")
 
-    rng = np.random.default_rng(random_state)
-    combinations = combinations[rng.permutation(len(combinations))]
+    min_active_cycles = int(min_active_cycles)
+    if allow_zero_cycles and min_active_cycles < 1:
+        raise gr.Error("Minimum active cycles must be at least 1 when sparse zero cycles are enabled.")
 
-    # Full Hamming distance in cycle counts, not proportions.
-    distances = np.count_nonzero(combinations[:, None, :] != combinations[None, :, :], axis=2).astype(np.int16)
+    max_genes_per_pool = min(pool_size, ngenes) if split_pools else ngenes
+    symbol_count = channels + int(allow_zero_cycles)
+    required_cycles = max(1, math.ceil(math.log(max(max_genes_per_pool, 2), symbol_count))) + int(hamming_distance)
+    if allow_zero_cycles and required_cycles < min_active_cycles:
+        required_cycles = min_active_cycles
 
-    balanced_mask = np.ones(len(combinations), dtype=bool)
-    for channel in range(1, channels + 1):
-        balanced_mask &= np.count_nonzero(combinations == channel, axis=1) < 2
+    def candidate_space(cycle_count: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
+        symbols = range(0 if allow_zero_cycles else 1, channels + 1)
+        combinations = np.array(list(product(symbols, repeat=cycle_count)), dtype=np.int16)
 
-    balanced_indices = np.flatnonzero(balanced_mask)
-    first_index = int(balanced_indices[0] if len(balanced_indices) else 0)
-    selected = [first_index]
-    remaining = np.ones(len(combinations), dtype=bool)
-    remaining[first_index] = False
+        active_counts = np.count_nonzero(combinations != 0, axis=1)
+        combinations = combinations[active_counts >= (min_active_cycles if allow_zero_cycles else 1)]
 
-    min_distance_to_selected = distances[first_index].copy()
-    while len(selected) < ngenes:
-        candidate_indices = np.flatnonzero(remaining)
-        if not len(candidate_indices):
+        homogeneous = np.all(combinations == combinations[:, [0]], axis=1)
+        combinations = combinations[~homogeneous]
+
+        balanced_mask = np.ones(len(combinations), dtype=bool)
+        for channel in range(1, channels + 1):
+            balanced_mask &= np.count_nonzero(combinations == channel, axis=1) < 2
+        balanced = combinations[balanced_mask]
+        if len(balanced) >= max_genes_per_pool:
+            combinations = balanced
+
+        rng = np.random.default_rng(seed)
+        combinations = combinations[rng.permutation(len(combinations))]
+        distances = np.count_nonzero(
+            combinations[:, None, :] != combinations[None, :, :],
+            axis=2,
+        ).astype(np.int16)
+        return combinations, distances
+
+    combinations, distances = candidate_space(required_cycles, random_state)
+    while len(combinations) < max_genes_per_pool and required_cycles < 24:
+        required_cycles += 1
+        combinations, distances = candidate_space(required_cycles, random_state)
+    if len(combinations) < max_genes_per_pool:
+        raise gr.Error("Not enough barcode combinations are available for the requested gene count.")
+
+    def select_codes(count: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
+        local_combinations, local_distances = candidate_space(required_cycles, seed)
+        if len(local_combinations) < count:
             raise gr.Error("Not enough barcode combinations are available for the requested gene count.")
 
-        best_candidate = candidate_indices[np.argmax(min_distance_to_selected[candidate_indices])]
-        selected.append(int(best_candidate))
-        remaining[best_candidate] = False
-        min_distance_to_selected = np.minimum(min_distance_to_selected, distances[best_candidate])
+        selected = [0]
+        remaining = np.ones(len(local_combinations), dtype=bool)
+        remaining[0] = False
+
+        min_distance_to_selected = local_distances[0].copy()
+        while len(selected) < count:
+            candidate_indices = np.flatnonzero(remaining)
+            best_candidate = candidate_indices[np.argmax(min_distance_to_selected[candidate_indices])]
+            selected.append(int(best_candidate))
+            remaining[best_candidate] = False
+            min_distance_to_selected = np.minimum(min_distance_to_selected, local_distances[best_candidate])
+
+        return local_combinations[selected], local_distances[np.ix_(selected, selected)]
 
     cycle_columns = list(range(1, required_cycles + 1))
-    selected_codebook = pd.DataFrame(combinations[selected], columns=cycle_columns)
-    assigned_codes = pd.concat([genesdf.loc[:, ["Gene", "LbarID"]], selected_codebook], axis=1)
-    codebook = pd.concat([genesdf.loc[:, ["Gene"]], selected_codebook], axis=1)
-    hamming_matrix = pd.DataFrame(distances[np.ix_(selected, selected)])
+    assigned_parts = []
+    hamming_parts = []
+    if split_pools:
+        pool_numbers = (np.arange(ngenes) // pool_size) + 1
+        for pool_number in sorted(np.unique(pool_numbers)):
+            pool_mask = pool_numbers == pool_number
+            pool_genes = genesdf.loc[pool_mask, ["Gene", "LbarID"]].reset_index(drop=True)
+            selected_codes, pool_distances = select_codes(len(pool_genes), random_state + int(pool_number) - 1)
+            selected_codebook = pd.DataFrame(selected_codes, columns=cycle_columns)
+            pool_meta = pd.DataFrame({
+                "Pool": int(pool_number),
+                "Pool position": np.arange(1, len(pool_genes) + 1),
+            })
+            assigned_parts.append(pd.concat([pool_genes, pool_meta, selected_codebook], axis=1))
+            hamming_parts.append(pool_distances)
+        assigned_codes = pd.concat(assigned_parts, ignore_index=True)
+        hamming_values = np.full((ngenes, ngenes), -1, dtype=np.int16)
+        offset = 0
+        for pool_distances in hamming_parts:
+            size = pool_distances.shape[0]
+            hamming_values[offset:offset + size, offset:offset + size] = pool_distances
+            offset += size
+        codebook = assigned_codes.loc[:, ["Gene", "Pool", "Pool position", *cycle_columns]].copy()
+        hamming_matrix = pd.DataFrame(hamming_values)
+    else:
+        selected_codes, selected_distances = select_codes(ngenes, random_state)
+        selected_codebook = pd.DataFrame(selected_codes, columns=cycle_columns)
+        assigned_codes = pd.concat([genesdf.loc[:, ["Gene", "LbarID"]], selected_codebook], axis=1)
+        codebook = pd.concat([genesdf.loc[:, ["Gene"]], selected_codebook], axis=1)
+        hamming_matrix = pd.DataFrame(selected_distances)
 
     return assigned_codes, codebook, hamming_matrix, required_cycles
 
@@ -655,10 +757,21 @@ def translate_to_robot(assigned_codes: pd.DataFrame, starting_id: int) -> pd.Dat
     if starting_id not in possible_starting_ids:
         raise gr.Error(f"Not a valid starting ID. Options: {possible_starting_ids}")
 
-    cycle_columns = list(assigned_codes.columns[2:])
+    cycle_columns = _cycle_columns(assigned_codes)
     channel_values = assigned_codes.loc[:, cycle_columns].to_numpy().ravel()
-    channels = sorted(int(channel) for channel in pd.unique(channel_values) if not pd.isna(channel))
-    machine_input = np.zeros((96 * len(channels), len(cycle_columns)), dtype=int)
+    positive_channels = [
+        int(channel)
+        for channel in pd.unique(channel_values)
+        if not pd.isna(channel) and int(channel) > 0
+    ]
+    if not positive_channels:
+        raise gr.Error("Assigned codes do not contain any positive channel values.")
+    channel_count = max(positive_channels)
+    pools = sorted(assigned_codes["Pool"].unique()) if "Pool" in assigned_codes.columns else [1]
+    pool_to_offset = {int(pool): index * len(cycle_columns) for index, pool in enumerate(pools)}
+    total_cycle_columns = len(cycle_columns) * len(pools)
+    _destination_wells_for_cycles(total_cycle_columns)
+    machine_input = np.zeros((96 * channel_count, total_cycle_columns), dtype=int)
 
     mod_codes = assigned_codes.loc[
         assigned_codes["LbarID"].isin(range(starting_id, starting_id + 96)), :
@@ -670,8 +783,12 @@ def translate_to_robot(assigned_codes: pd.DataFrame, starting_id: int) -> pd.Dat
     for cycle_index, cycle in enumerate(cycle_columns):
         for _, row in mod_codes.iterrows():
             channel = int(row[cycle])
+            if channel == 0:
+                continue
             robot_row = int(row["well_index"]) + 96 * (channel - 1)
-            machine_input[robot_row, cycle_index] = 1
+            pool = int(row["Pool"]) if "Pool" in mod_codes.columns else 1
+            robot_col = pool_to_offset[pool] + cycle_index
+            machine_input[robot_row, robot_col] = 1
 
     return pd.DataFrame(machine_input)
 
@@ -687,16 +804,22 @@ def explain_barcode_pipetting(assigned_codes: pd.DataFrame, lbar_id: int) -> pd.
 
     record = match.iloc[0]
     plate_number, starting_id, well_index, source_well = _barcode_plate_info(lbar_id)
-    destination_wells = _destination_wells_for_cycles(len(assigned_codes.columns[2:]))
+    cycle_columns = _cycle_columns(assigned_codes)
+    pools = sorted(assigned_codes["Pool"].unique()) if "Pool" in assigned_codes.columns else [1]
+    pool = int(record["Pool"]) if "Pool" in assigned_codes.columns else 1
+    pool_offset = pools.index(pool) * len(cycle_columns)
+    destination_wells = _destination_wells_for_cycles(len(cycle_columns) * len(pools))
     explained = []
-    for cycle_index, cycle in enumerate(assigned_codes.columns[2:]):
+    for cycle_index, cycle in enumerate(cycle_columns):
         channel = int(record[cycle])
-        source_deck_slot = channel + 1
-        destination_well = destination_wells[cycle_index]
+        source_deck_slot = channel + 1 if channel > 0 else ""
+        destination_well = destination_wells[pool_offset + cycle_index]
+        robot_row = well_index + 96 * (channel - 1) if channel > 0 else ""
         explained.append(
             {
                 "Gene": record["Gene"],
                 "LbarID": lbar_id,
+                **({"Pool": pool, "Pool position": int(record["Pool position"])} if "Pool" in assigned_codes.columns else {}),
                 "Barcode ID plate": plate_number,
                 "Barcode plate starting ID": starting_id,
                 "Source deck slot": source_deck_slot,
@@ -705,8 +828,8 @@ def explain_barcode_pipetting(assigned_codes: pd.DataFrame, lbar_id: int) -> pd.
                 "Channel": channel,
                 "Destination deck slot": 1,
                 "Destination well": destination_well,
-                "Robot CSV row": well_index + 96 * (channel - 1),
-                "Robot CSV column": cycle_index,
+                "Robot CSV row": robot_row,
+                "Robot CSV column": pool_offset + cycle_index,
             }
         )
     return pd.DataFrame(explained)
@@ -792,14 +915,24 @@ def verify_barcode_robot_input(
     actual = robot_input.fillna(0).astype(int)
     statuses = []
     for _, row in explanation.iterrows():
-        robot_row = int(row["Robot CSV row"])
         robot_col = int(row["Robot CSV column"])
-        present = (
-            robot_row < actual.shape[0]
-            and robot_col < actual.shape[1]
-            and int(actual.iat[robot_row, robot_col]) != 0
-        )
-        statuses.append("OK" if present else "Missing")
+        if int(row["Channel"]) == 0:
+            _, _, well_index, _ = _barcode_plate_info(int(lbar_id))
+            unexpected = False
+            if robot_col < actual.shape[1]:
+                for robot_row in range(well_index, actual.shape[0], 96):
+                    if int(actual.iat[robot_row, robot_col]) != 0:
+                        unexpected = True
+                        break
+            statuses.append("Unexpected transfer" if unexpected else "Expected blank")
+        else:
+            robot_row = int(row["Robot CSV row"])
+            present = (
+                robot_row < actual.shape[0]
+                and robot_col < actual.shape[1]
+                and int(actual.iat[robot_row, robot_col]) != 0
+            )
+            statuses.append("OK" if present else "Missing")
 
     explanation = explanation.copy()
     explanation["Instruction status"] = statuses
@@ -917,6 +1050,10 @@ def run_assign_workflow(
     use_hamming,
     tag,
     random_state,
+    split_pools,
+    pool_size,
+    allow_zero_cycles,
+    min_active_cycles,
     subset_range,
     subset_start_lbar_id,
     subset_end_lbar_id,
@@ -934,6 +1071,10 @@ def run_assign_workflow(
         channels=int(channels),
         hamming_distance=bool(use_hamming),
         random_state=int(random_state),
+        split_pools=bool(split_pools),
+        pool_size=int(pool_size),
+        allow_zero_cycles=bool(allow_zero_cycles),
+        min_active_cycles=int(min_active_cycles),
     )
 
     clean_tag = _clean_tag(tag, "codebook")
@@ -944,6 +1085,11 @@ def run_assign_workflow(
         f"Created {len(assigned_codes)} assigned codes with {required_cycles} cycles "
         f"and {int(channels)} channels."
     )
+    if split_pools:
+        summary += f" Split into {assigned_codes['Pool'].nunique()} pool(s) with up to {int(pool_size)} genes each."
+    if allow_zero_cycles:
+        zero_count = int((assigned_codes.loc[:, _cycle_columns(assigned_codes)] == 0).to_numpy().sum())
+        summary += f" Sparse zero cycles enabled with at least {int(min_active_cycles)} active cycle(s) per code ({zero_count} zero entries)."
     if subset_range:
         summary += (
             f" Subset input from {input_rows} rows to {len(genesdf)} rows using "
@@ -1040,6 +1186,10 @@ def run_full_workflow(
     tag,
     random_state,
     starting_id,
+    split_pools,
+    pool_size,
+    allow_zero_cycles,
+    min_active_cycles,
     subset_range,
     subset_start_lbar_id,
     subset_end_lbar_id,
@@ -1064,6 +1214,10 @@ def run_full_workflow(
         channels=channels,
         hamming_distance=bool(use_hamming),
         random_state=random_state,
+        split_pools=bool(split_pools),
+        pool_size=int(pool_size),
+        allow_zero_cycles=bool(allow_zero_cycles),
+        min_active_cycles=int(min_active_cycles),
     )
     robot_input = translate_to_robot(assigned_codes, starting_id)
     verification_summary, issues = verify_robot_input_matrix(assigned_codes, robot_input, starting_id)
@@ -1093,6 +1247,10 @@ def run_full_workflow(
         f"- Hamming-distance extra cycle: {bool(use_hamming)}",
         f"- Random seed: {random_state}",
         f"- Plate starting ID: {starting_id}",
+        f"- Split pools: {bool(split_pools)}",
+        f"- Pool size: {int(pool_size)}",
+        f"- Sparse zero cycles: {bool(allow_zero_cycles)}",
+        f"- Minimum active cycles: {int(min_active_cycles)}",
         f"- Subset to LbarID range: {bool(subset_range)}",
         f"- Subset LbarID start: {int(subset_start_lbar_id)}",
         f"- Subset LbarID end: {int(subset_end_lbar_id)}",
@@ -1103,6 +1261,7 @@ def run_full_workflow(
         f"- Uploaded input rows: {input_rows}",
         f"- Assigned rows: {len(assigned_codes)}",
         f"- Required cycles: {required_cycles}",
+        f"- Pool count: {assigned_codes['Pool'].nunique() if 'Pool' in assigned_codes.columns else 1}",
         f"- Codebook shape: {codebook.shape[0]} rows x {codebook.shape[1]} columns",
         f"- Hamming matrix shape: {hamming_matrix.shape[0]} x {hamming_matrix.shape[1]}",
         duplicate_warning.strip() or "- Duplicate LbarID check: none detected",
@@ -1196,6 +1355,10 @@ with gr.Blocks(title="L-probe Barcode Tools") as demo:
         full_tag = gr.Textbox(label="Output tag", value="standard_barcoding_scheme")
         full_random_state = gr.Number(label="Random seed", value=0, precision=0)
         full_starting_id = gr.Number(label="Plate starting ID", value=201, precision=0)
+        full_split_pools = gr.Checkbox(label="Split genes into separate barcode pools", value=False)
+        full_pool_size = gr.Number(label="Genes per pool", value=48, precision=0)
+        full_allow_zero_cycles = gr.Checkbox(label="Allow sparse zero cycles", value=False)
+        full_min_active_cycles = gr.Number(label="Minimum active cycles per code", value=2, precision=0)
         full_subset_range = gr.Checkbox(
             label="Subset input to an LbarID range before assigning codebook",
             value=False,
@@ -1221,6 +1384,10 @@ with gr.Blocks(title="L-probe Barcode Tools") as demo:
         assign_hamming = gr.Checkbox(label="Add one extra cycle for Hamming-distance error correction", value=True)
         assign_tag = gr.Textbox(label="Output tag", value="standard_barcoding_scheme")
         assign_random_state = gr.Number(label="Random seed", value=0, precision=0)
+        assign_split_pools = gr.Checkbox(label="Split genes into separate barcode pools", value=False)
+        assign_pool_size = gr.Number(label="Genes per pool", value=48, precision=0)
+        assign_allow_zero_cycles = gr.Checkbox(label="Allow sparse zero cycles", value=False)
+        assign_min_active_cycles = gr.Number(label="Minimum active cycles per code", value=2, precision=0)
         assign_subset_range = gr.Checkbox(
             label="Subset input to an LbarID range before assigning codebook",
             value=False,
@@ -1323,6 +1490,10 @@ with gr.Blocks(title="L-probe Barcode Tools") as demo:
             full_tag,
             full_random_state,
             full_starting_id,
+            full_split_pools,
+            full_pool_size,
+            full_allow_zero_cycles,
+            full_min_active_cycles,
             full_subset_range,
             full_subset_start_lbar_id,
             full_subset_end_lbar_id,
@@ -1345,6 +1516,10 @@ with gr.Blocks(title="L-probe Barcode Tools") as demo:
             assign_hamming,
             assign_tag,
             assign_random_state,
+            assign_split_pools,
+            assign_pool_size,
+            assign_allow_zero_cycles,
+            assign_min_active_cycles,
             assign_subset_range,
             assign_subset_start_lbar_id,
             assign_subset_end_lbar_id,
