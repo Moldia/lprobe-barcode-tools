@@ -127,10 +127,6 @@ Use this workflow to create barcode assignments from a gene/LbarID table.
 | Add one extra cycle for Hamming-distance error correction | Adds an extra cycle to increase barcode separation |
 | Output tag | Text inserted into output filenames |
 | Random seed | Controls reproducible assignment |
-| Split genes into separate barcode pools | Assigns each pool independently so code patterns may be reused across physical pools |
-| Genes per pool | Maximum number of genes assigned to each pool, for example `48` for a `96 -> 2 x 48` split |
-| Allow sparse zero cycles | Allows `0` in cycle columns, meaning no detection oligo is pipetted for that gene/cycle |
-| Minimum active cycles per code | Minimum number of nonzero cycle entries required when sparse zero cycles are enabled |
 | Subset input to an LbarID range before assigning codebook | Optional filter |
 | Subset start LbarID | First LbarID to include, inclusive |
 | Subset end LbarID | Last LbarID to include, inclusive |
@@ -142,10 +138,6 @@ Use this workflow to create barcode assignments from a gene/LbarID table.
 | Assigned codes | `assigned_codes_<tag>.csv` | Main file for downstream workflows |
 | Codebook | `codebook_<tag>.csv` | Barcode codebook used for assignment |
 | Hamming-distance matrix | `hamming_distances_<tag>.csv` | Diagnostic matrix showing barcode distances |
-
-When split pools are enabled, the assigned-codes output includes `Pool` and `Pool position` columns.
-The Hamming-distance matrix reports within-pool distances and uses `-1` for cross-pool comparisons,
-because cross-pool code reuse is intentional.
 
 ### What to do next
 
@@ -336,10 +328,6 @@ Use this workflow to run the complete pipeline from a gene/LbarID CSV.
 | Output tag | Text inserted into output filenames |
 | Random seed | Controls reproducible assignment |
 | Plate starting ID | First LbarID on the source plate block |
-| Split genes into separate barcode pools | Assigns each pool independently and places each pool's cycles in separate robot-input columns |
-| Genes per pool | Maximum number of genes assigned to each pool |
-| Allow sparse zero cycles | Allows cycle value `0`, which creates no robot transfer for that gene/cycle |
-| Minimum active cycles per code | Minimum number of nonzero cycles required when sparse zero cycles are enabled |
 | Subset input to an LbarID range before assigning codebook | Optional LbarID range filter |
 | Subset start LbarID | First LbarID to include, inclusive |
 | Subset end LbarID | Last LbarID to include, inclusive |
